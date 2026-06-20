@@ -2,7 +2,7 @@
 
 > **观测 · 诊断 · 进化 / Observe · Diagnose · Evolve**
 
-[![GitHub Stars](https://img.shields.io/github/stars/MarioM2026/zhixu-ACOP-AI?style=social)](https://github.com/MarioM2026/zhixu-ACOP-AI/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/MarioM2026/zhixu-ACOP-AICodeCopilot?style=social)](https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot/stargazers)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-green)](package.json)
 [![TypeScript](https://img.shields.io/badge/lang-TypeScript-blue)](https://www.typescriptlang.org/)
@@ -68,7 +68,7 @@ IF  TTFT > 2s                             →   THEN  注入并发调用提示
 
 ```bash
 # 克隆项目
-git clone https://github.com/MarioM2026/zhixu-ACOP-AI.git
+git clone https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot.git
 cd zhixu-ACOP-AI
 
 # 安装依赖（Node.js ≥ 18）
@@ -198,7 +198,7 @@ Route every call to the best model based on task type, token budget, and current
 
 ```bash
 # Clone
-git clone https://github.com/MarioM2026/zhixu-ACOP-AI.git
+git clone https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot.git
 cd zhixu-ACOP-AI
 
 # Install (Node.js >= 18 required)
@@ -300,6 +300,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 如果你认同"**把 AI 编程助手从监控升级到进化**"的方向，请在 GitHub 给一颗 Star：
 
-👉 [github.com/MarioM2026/zhixu-ACOP-AI](https://github.com/MarioM2026/zhixu-ACOP-AI)
+👉 [github.com/MarioM2026/zhixu-ACOP-AICodeCopilot](https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot)
 
 If you believe **"AI copilots should evolve, not just be watched"**, give us a star on GitHub. 每一颗 Star / every star 都是社区对"让 AI 越来越聪明"的认可。

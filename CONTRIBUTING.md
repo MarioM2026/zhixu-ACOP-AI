@@ -39,14 +39,14 @@
 
 ```bash
 # 1. Fork 仓库
-# 访问 https://github.com/MarioM2026/zhixu-ACOP-AI 并点击 Fork
+# 访问 https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot 并点击 Fork
 
 # 2. 克隆你的 Fork
-git clone https://github.com/MarioM2026/zhixu-ACOP-AI.git
+git clone https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot.git
 cd zhixu-ACOP-AI
 
 # 3. 添加上游仓库
-git remote add upstream https://github.com/MarioM2026/zhixu-ACOP-AI.git
+git remote add upstream https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot.git
 
 # 4. 安装依赖
 npm install
@@ -357,7 +357,7 @@ fix(collector): 修复 OTEL 数据解析错误
 
 如果发现问题，请：
 
-1. 在 [Issues](https://github.com/MarioM2026/zhixu-ACOP-AI/issues) 中搜索是否已有相同问题
+1. 在 [Issues](https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot/issues) 中搜索是否已有相同问题
 2. 使用 Bug 模板创建新 Issue
 3. 提供详细的复现步骤
 4. 包含系统信息和日志
@@ -384,7 +384,7 @@ fix(collector): 修复 OTEL 数据解析错误
 
 ### 贡献者列表
 
-本项目的所有贡献者都会在 [Contributors](https://github.com/MarioM2026/zhixu-ACOP-AI/graphs/contributors) 页面列出。
+本项目的所有贡献者都会在 [Contributors](https://github.com/MarioM2026/zhixu-ACOP-AICodeCopilot/graphs/contributors) 页面列出。
 
 ### 如何成为贡献者
 
