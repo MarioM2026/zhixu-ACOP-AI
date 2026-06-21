@@ -5,71 +5,51 @@ import { loadJSON, schedulePersist, saveJSON } from './storageService';
 
 const STORAGE_KEY = 'ai-code-events';
 
+/** 内存中保留的最大事件数（超过后自动清理最老的事件）*/
+const MAX_EVENTS_IN_MEMORY = 5000;
+
+/** 事件数据保留天数（超过此天数的事件会被归档/清理）*/
+const RETENTION_DAYS = 30;
+
 const events: Map<string, AICodeEvent> = new Map();
 
 /** 真实数据标记：是否包含从 Trae/Cursor/Claude 等适配器采集到的真实事件 */
 let hasRealData: boolean = false;
 
-function getSampleEvents(): AICodeEvent[] {
-  const now = Date.now();
-  const sessionId = 'seed-session-' + Math.floor(Math.random() * 1000);
-  const tools: Array<'trae' | 'claude_code' | 'cursor' | 'github_copilot'> = ['trae', 'claude_code', 'cursor', 'github_copilot'];
-  const models = ['claude-sonnet-4', 'gpt-4-turbo', 'deepseek-v3'];
-
-  return Array.from({ length: 15 }, (_, i) => {
-    const hasError = Math.random() < 0.2;
-    const tool = tools[Math.floor(Math.random() * tools.length)];
-    const inputTokens = Math.floor(Math.random() * 3000) + 500;
-    const outputTokens = Math.floor(Math.random() * 2000) + 300;
-    const eventId = 'seed-event-' + i + '-' + Math.floor(Math.random() * 1000000);
-    return {
-      id: eventId,
-      traceId: 'trace-seed-' + i + '-' + Math.floor(Math.random() * 10000),
-      sessionId,
-      tool,
-      modelId: models[Math.floor(Math.random() * models.length)],
-      timestamp: now - (15 - i) * 60 * 1000 * Math.floor(Math.random() * 5 + 1),
-      tokenConsumption: {
-        input: inputTokens,
-        output: outputTokens,
-        total: inputTokens + outputTokens,
-      },
-      performance: {
-        latency: Math.floor(Math.random() * 8000) + 500,
-        ttft: Math.floor(Math.random() * 3000) + 200,
-      },
-      quality: hasError
-        ? {
-            errorType: ['timeout', 'invalid_response', 'context_overflow'][Math.floor(Math.random() * 3)],
-            errorMessage: '请求超时或响应格式异常',
-            codeAcceptance: false,
-          }
-        : {
-            codeAcceptance: true,
-          },
-      metadata: {
-        version: '1.0.0',
-        environment: 'development',
-      },
-    };
-  });
-}
-
-/** 从持久化加载。若持久化文件为空 → 注入 15 条模拟数据；有数据 → 使用真实数据 */
+/** 从持久化加载。若持久化文件为空 → 空数据等待采集；有数据 → 使用真实数据 */
 export async function loadFromStorage(): Promise<void> {
   const saved = await loadJSON<AICodeEvent[]>(STORAGE_KEY, []);
   events.clear();
 
-  if (saved.length > 0) {
-    saved.forEach((event) => events.set(event.id || uuidv4(), event));
+  // 数据保留策略：只加载最近 RETENTION_DAYS 天内的数据
+  const cutoffTime = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let loaded = 0;
+  let dropped = 0;
+
+  for (const event of saved) {
+    if (event.timestamp && event.timestamp >= cutoffTime) {
+      events.set(event.id || uuidv4(), event);
+      loaded++;
+    } else {
+      dropped++;
+    }
+  }
+
+  // 内存上限保护：如果超过 MAX_EVENTS_IN_MEMORY，保留最新的事件
+  if (events.size > MAX_EVENTS_IN_MEMORY) {
+    const sorted = Array.from(events.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const toRemove = sorted.slice(MAX_EVENTS_IN_MEMORY);
+    toRemove.forEach((e) => events.delete(e.id));
+    dropped += toRemove.length;
+    logger.info(`[Events] 内存保护：保留最近 ${MAX_EVENTS_IN_MEMORY} 条事件，丢弃 ${toRemove.length} 条超上限事件`);
+  }
+
+  if (loaded > 0) {
     hasRealData = true;
-    logger.info(`[Events] 从持久化加载 ${saved.length} 条事件（真实数据）`);
+    logger.info(`[Events] 从持久化加载 ${loaded} 条事件（真实数据）` + (dropped > 0 ? `，丢弃 ${dropped} 条超期事件` : ''));
   } else {
-    const sample = getSampleEvents();
-    sample.forEach((event) => events.set(event.id || uuidv4(), event));
     hasRealData = false;
-    logger.info(`[Events] 首次启动，注入 ${sample.length} 条示例事件（模拟数据）`);
-    schedulePersist(STORAGE_KEY, () => Array.from(events.values()));
+    logger.info(`[Events] 无历史数据，等待适配器采集真实 AI 使用事件...`);
   }
 }
 
@@ -77,15 +57,13 @@ function persist(): void {
   schedulePersist(STORAGE_KEY, () => Array.from(events.values()));
 }
 
-/** 重置事件：清空所有数据并恢复 15 条模拟数据。返回重置后的事件总数 */
+/** 重置事件：清空所有数据。返回 0 */
 export async function resetEventsToSample(): Promise<number> {
   events.clear();
-  const sample = getSampleEvents();
-  sample.forEach((event) => events.set(event.id || uuidv4(), event));
   hasRealData = false;
-  await saveJSON(STORAGE_KEY, Array.from(events.values()));
-  logger.info(`[Events] 已重置为 ${sample.length} 条示例事件`);
-  return events.size;
+  await saveJSON(STORAGE_KEY, []);
+  logger.info('[Events] 已清空所有事件（真实数据模式：不注入演示数据）');
+  return 0;
 }
 
 /** 清空所有事件。返回 0 */
@@ -100,6 +78,111 @@ export async function clearAllEvents(): Promise<number> {
 /** 是否有真实数据（非模拟 seed 数据） */
 export function hasRealEvents(): boolean {
   return hasRealData;
+}
+
+/** 获取指定时间范围内的事件 */
+export async function getEventsInTimeRange(startTime: number, endTime: number): Promise<AICodeEvent[]> {
+  const allEvents = Array.from(events.values());
+  return allEvents.filter((e) => e.timestamp >= startTime && e.timestamp <= endTime);
+}
+
+/** 获取指定时间范围内的汇总统计（供仪表盘使用） */
+export async function getAggregatedStats(params: { days?: number; startDate?: string; endDate?: string }): Promise<{
+  totalTokens: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalRequests: number;
+  totalLatency: number;
+  errorCount: number;
+  byTool: Record<string, { requestCount: number; totalTokens: number; totalLatency: number; errorCount: number }>;
+  byDate: Record<string, { inputTokens: number; outputTokens: number; totalTokens: number }>;
+  errorDistribution: Record<string, number>;
+  sessionCount: number;
+  modelUsage: Record<string, number>;
+}> {
+  const now = Date.now();
+  const days = params.days || 7;
+  const endTime = params.endDate ? new Date(params.endDate).getTime() : now;
+  const startTime = params.startDate ? new Date(params.startDate).getTime() : now - days * 24 * 60 * 60 * 1000;
+
+  const inRange = Array.from(events.values()).filter((e) => e.timestamp >= startTime && e.timestamp <= endTime);
+
+  const result = {
+    totalTokens: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalRequests: inRange.length,
+    totalLatency: 0,
+    errorCount: 0,
+    byTool: {} as Record<string, { requestCount: number; totalTokens: number; totalLatency: number; errorCount: number }>,
+    byDate: {} as Record<string, { inputTokens: number; outputTokens: number; totalTokens: number }>,
+    errorDistribution: {} as Record<string, number>,
+    sessionCount: new Set(inRange.map((e) => e.sessionId)).size,
+    modelUsage: {} as Record<string, number>,
+  };
+
+  for (const event of inRange) {
+    const input = event.tokenConsumption?.input || 0;
+    const output = event.tokenConsumption?.output || 0;
+    const total = input + output;
+    const latency = event.performance?.latency || 0;
+    const hasError = !!event.quality?.errorType;
+
+    result.totalInputTokens += input;
+    result.totalOutputTokens += output;
+    result.totalTokens += total;
+    result.totalLatency += latency;
+    if (hasError) result.errorCount++;
+
+    // 按工具聚合
+    const toolKey = event.tool || 'unknown';
+    if (!result.byTool[toolKey]) {
+      result.byTool[toolKey] = { requestCount: 0, totalTokens: 0, totalLatency: 0, errorCount: 0 };
+    }
+    result.byTool[toolKey].requestCount++;
+    result.byTool[toolKey].totalTokens += total;
+    result.byTool[toolKey].totalLatency += latency;
+    if (hasError) result.byTool[toolKey].errorCount++;
+
+    // 按日期聚合（用于 Token 趋势）
+    const dateStr = new Date(event.timestamp).toISOString().split('T')[0];
+    if (!result.byDate[dateStr]) {
+      result.byDate[dateStr] = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    }
+    result.byDate[dateStr].inputTokens += input;
+    result.byDate[dateStr].outputTokens += output;
+    result.byDate[dateStr].totalTokens += total;
+
+    // 错误类型分布
+    if (hasError) {
+      const errType = event.quality?.errorType || 'unknown';
+      result.errorDistribution[errType] = (result.errorDistribution[errType] || 0) + 1;
+    }
+
+    // 模型使用
+    if (event.modelId) {
+      result.modelUsage[event.modelId] = (result.modelUsage[event.modelId] || 0) + 1;
+    }
+  }
+
+  return result;
+}
+
+/** 清理超过 RETENTION_DAYS 的老事件（可定期调用） */
+export async function cleanupOldEvents(): Promise<{ removed: number; remaining: number }> {
+  const cutoffTime = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const [id, event] of events.entries()) {
+    if (event.timestamp < cutoffTime) {
+      events.delete(id);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    persist();
+    logger.info(`[Events] 清理 ${removed} 条超期事件，剩余 ${events.size} 条`);
+  }
+  return { removed, remaining: events.size };
 }
 
 // 记录 AI 代码事件（带 token 安全校验：避免解析错误导致的万亿级 token 数据）
@@ -148,6 +231,16 @@ export async function recordAICodeEvent(event: AICodeEvent): Promise<AICodeEvent
   hasRealData = true;
 
   events.set(id, newEvent);
+
+  // 内存上限保护：如果事件数超过 MAX_EVENTS_IN_MEMORY，删除最老的事件
+  if (events.size > MAX_EVENTS_IN_MEMORY) {
+    const sorted = Array.from(events.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const toRemove = sorted.slice(MAX_EVENTS_IN_MEMORY);
+    const removedCount = toRemove.length;
+    toRemove.forEach((e) => events.delete(e.id));
+    logger.info(`[Events] 内存保护：删除 ${removedCount} 条最老事件，保留 ${MAX_EVENTS_IN_MEMORY} 条`);
+  }
+
   if (hasTokenAnomaly) {
     logger.warn(`Token 异常已被修正`, {
       id,

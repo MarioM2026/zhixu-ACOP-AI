@@ -11,54 +11,11 @@ const STORAGE_KEY_RULES = 'alert-rules';
 const STORAGE_KEY_ALERTS = 'alert-history';
 
 const DEDUP_WINDOW_MS = 10 * 60 * 1000; // 同一规则在 10 分钟内不重复发送告警
+const ALERT_RETENTION_DAYS = 30; // 告警保留天数
+const MAX_ALERTS_IN_MEMORY = 1000; // 内存中保留的最大告警数
 
 const rules: Map<string, Rule> = new Map();
 const alerts: Map<string, Alert> = new Map();
-
-/** 真实数据标记：是否包含实际生成的告警（非模拟 seed 数据） */
-let alertsHasRealData: boolean = false;
-
-/** 生成 15 条模拟告警数据（用于数据为空时的默认展示） */
-function getSampleAlerts(): Alert[] {
-  const now = Date.now();
-  const severityOptions: Array<'info' | 'warning' | 'critical'> = ['info', 'warning', 'critical'];
-  const alertTemplates = [
-    { name: '上下文清理预警', ruleId: 'rule-001', priority: 'high' },
-    { name: 'Token 超预算告警', ruleId: 'rule-002', priority: 'medium' },
-    { name: '错误率过高告警', ruleId: 'rule-003', priority: 'medium' },
-    { name: '延迟过高告警', ruleId: 'rule-004', priority: 'low' },
-  ];
-
-  const sampleAlerts: Alert[] = [];
-  for (let i = 0; i < 15; i++) {
-    const template = alertTemplates[i % alertTemplates.length];
-    const severity = severityOptions[i % 3];
-    const minutesAgo = Math.floor((i + 1) * 15 + Math.random() * 10);
-    const timestamp = now - minutesAgo * 60 * 1000;
-
-    const totalTokens = 5000 + Math.floor(Math.random() * 80000);
-    const errorRate = Number((Math.random() * 8).toFixed(2));
-    const avgLatency = 500 + Math.floor(Math.random() * 4500);
-    const requestCount = 10 + Math.floor(Math.random() * 90);
-
-    sampleAlerts.push({
-      id: 'seed-alert-' + i + '-' + Math.floor(Math.random() * 1000000),
-      ruleId: template.ruleId,
-      severity,
-      title: '规则触发: ' + template.name,
-      message: '规则 \"' + template.name + '\" 的条件已满足 (阈值 ' + (template.priority === 'high' ? '80%' : template.priority === 'medium' ? '100000' : '5000ms') + ')，触发动作: send_alert',
-      timestamp,
-      acknowledged: i < 3,
-      metadata: {
-        tokenUsage: String(totalTokens),
-        errorRate: String(errorRate),
-        avgLatency: String(avgLatency),
-        requestCount: String(requestCount),
-      },
-    });
-  }
-  return sampleAlerts;
-}
 
 function getDefaultRules(): Rule[] {
   return [
@@ -173,18 +130,34 @@ export async function loadFromStorage(): Promise<void> {
     schedulePersist(STORAGE_KEY_RULES, () => Array.from(rules.values()));
   }
 
+  // 从持久化加载告警，并应用保留策略
   const savedAlerts = await loadJSON<Alert[]>(STORAGE_KEY_ALERTS, []);
   alerts.clear();
-  if (savedAlerts.length > 0) {
-    savedAlerts.forEach((alert) => alerts.set(alert.id, alert));
-    alertsHasRealData = true;
-    logger.info(`[Alerts] 从持久化加载 ${savedAlerts.length} 条告警记录（真实数据）`);
+  const cutoffTime = Date.now() - ALERT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let loadedCount = 0;
+  let droppedCount = 0;
+
+  for (const alert of savedAlerts) {
+    if (alert.timestamp && alert.timestamp >= cutoffTime) {
+      alerts.set(alert.id, alert);
+      loadedCount++;
+    } else {
+      droppedCount++;
+    }
+  }
+
+  // 内存上限保护：超过 MAX_ALERTS_IN_MEMORY 时保留最新的
+  if (alerts.size > MAX_ALERTS_IN_MEMORY) {
+    const sorted = Array.from(alerts.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const toRemove = sorted.slice(MAX_ALERTS_IN_MEMORY);
+    droppedCount += toRemove.length;
+    toRemove.forEach((a) => alerts.delete(a.id));
+  }
+
+  if (loadedCount > 0) {
+    logger.info(`[Alerts] 从持久化加载 ${loadedCount} 条告警记录` + (droppedCount > 0 ? `，丢弃 ${droppedCount} 条过期告警` : ''));
   } else {
-    const sample = getSampleAlerts();
-    sample.forEach((alert) => alerts.set(alert.id, alert));
-    alertsHasRealData = false;
-    logger.info(`[Alerts] 首次启动，注入 ${sample.length} 条示例告警（模拟数据）`);
-    schedulePersist(STORAGE_KEY_ALERTS, () => Array.from(alerts.values()));
+    logger.info('[Alerts] 无历史告警，等待规则触发生成真实告警...');
   }
 }
 
@@ -304,7 +277,15 @@ async function executeAction(rule: Rule, metricData: MetricData): Promise<Alert 
   };
 
   alerts.set(alert.id, alert);
-  alertsHasRealData = true;
+
+  // 告警保留策略检查：超过 MAX_ALERTS_IN_MEMORY 时删除最老的告警
+  if (alerts.size > MAX_ALERTS_IN_MEMORY) {
+    const sorted = Array.from(alerts.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const toRemove = sorted.slice(MAX_ALERTS_IN_MEMORY);
+    toRemove.forEach((a) => alerts.delete(a.id));
+    logger.info(`[Alerts] 保留策略：删除 ${toRemove.length} 条最老告警，保留最新 ${MAX_ALERTS_IN_MEMORY} 条`);
+  }
+
   logger.info(`Alert generated: ${alert.id}`, { ruleId: rule.id, action: rule.action.type, severity: alert.severity, triggerCount: updatedRule.triggerCount });
   persistAlerts();
 
@@ -510,27 +491,40 @@ export async function acknowledgeAllAlerts(): Promise<number> {
   return count;
 }
 
-/** 重置告警：清空所有记录并恢复 15 条模拟数据。返回重置后的总数 */
+/** 重置告警：清空所有记录并持久化空数据。返回 0 */
 export async function resetAlertsToSample(): Promise<number> {
   alerts.clear();
-  const sample = getSampleAlerts();
-  sample.forEach((alert) => alerts.set(alert.id, alert));
-  alertsHasRealData = false;
-  await saveJSON(STORAGE_KEY_ALERTS, Array.from(alerts.values()));
-  logger.info(`[Alerts] 已重置为 ${sample.length} 条示例告警`);
-  return alerts.size;
+  await saveJSON(STORAGE_KEY_ALERTS, []);
+  logger.info('[Alerts] 已清空所有告警（真实数据模式：不注入演示数据）');
+  return 0;
 }
 
 /** 清空所有告警。返回 0 */
 export async function clearAllAlerts(): Promise<number> {
   alerts.clear();
-  alertsHasRealData = false;
   await saveJSON(STORAGE_KEY_ALERTS, []);
   logger.info('[Alerts] 已清空所有告警记录');
   return 0;
 }
 
-/** 是否有真实告警数据（非模拟 seed 数据） */
+/** 检查是否有告警数据 */
 export function hasRealAlerts(): boolean {
-  return alertsHasRealData;
+  return alerts.size > 0;
+}
+
+/** 清理超期告警（可定期调用） */
+export async function cleanupOldAlerts(): Promise<{ removed: number; remaining: number }> {
+  const cutoffTime = Date.now() - ALERT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const [id, alert] of alerts.entries()) {
+    if (alert.timestamp < cutoffTime) {
+      alerts.delete(id);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    persistAlerts();
+    logger.info(`[Alerts] 清理 ${removed} 条超期告警，剩余 ${alerts.size} 条`);
+  }
+  return { removed, remaining: alerts.size };
 }

@@ -4,16 +4,19 @@
  */
 
 import { logger } from './logger';
-import { getRules, triggerRule } from './ruleService';
+import { getRules, triggerRule, cleanupOldAlerts } from './ruleService';
+import { cleanupOldEvents } from './aiCodeEventService';
 
 // 调度器配置
-const SCHEDULER_INTERVAL_MS = 60 * 1000; // 每 60 秒扫描一次
+const SCHEDULER_INTERVAL_MS = 60 * 1000; // 每 60 秒扫描一次规则
 const RULE_COOLDOWN_MS = 5 * 60 * 1000; // 同一规则 5 分钟内不重复触发
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 每 1 小时清理一次过期数据
 
 // 调度器状态
 let schedulerTimer: NodeJS.Timeout | null = null;
+let cleanupTimer: NodeJS.Timeout | null = null;
 let isRunning = false;
-const lastTriggeredTime: Map<string, number> = new Map(); // 记录每个规则上次触发时间
+const lastTriggeredTime: Map<string, number> = new Map();
 
 // 调度统计
 const stats = {
@@ -94,24 +97,46 @@ export function startScheduler(): void {
   stats.activeSince = Date.now();
   logger.info(`[Scheduler] Starting rule scheduler (interval: ${SCHEDULER_INTERVAL_MS}ms, cooldown: ${RULE_COOLDOWN_MS}ms)`);
 
-  // 立即执行一次
+  // 立即执行一次规则扫描
   runRuleScan().catch((e) => logger.error('[Scheduler] Initial scan failed', { error: String(e) }));
 
-  // 然后按间隔定时执行
+  // 按间隔定时执行规则扫描
   schedulerTimer = setInterval(() => {
     runRuleScan().catch((e) => logger.error('[Scheduler] Scheduled scan failed', { error: String(e) }));
   }, SCHEDULER_INTERVAL_MS);
+
+  // 启动数据清理定时器（每小时执行一次）
+  cleanupTimer = setInterval(async () => {
+    try {
+      const eventResult = await cleanupOldEvents();
+      const alertResult = await cleanupOldAlerts();
+      if (eventResult.removed > 0 || alertResult.removed > 0) {
+        logger.info(`[Scheduler] Cleanup done: ${eventResult.removed} events, ${alertResult.removed} alerts removed`);
+      }
+    } catch (e) {
+      logger.error('[Scheduler] Cleanup failed', { error: String(e) });
+    }
+  }, CLEANUP_INTERVAL_MS);
 }
 
 /**
  * 停止调度器
  */
 export function stopScheduler(): void {
+  let stopped = false;
   if (schedulerTimer) {
     clearInterval(schedulerTimer);
     schedulerTimer = null;
+    stopped = true;
+  }
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+    stopped = true;
+  }
+  if (stopped) {
     isRunning = false;
-    logger.info('[Scheduler] Scheduler stopped');
+    logger.info('[Scheduler] Scheduler stopped (rule scan + data cleanup)');
   }
 }
 

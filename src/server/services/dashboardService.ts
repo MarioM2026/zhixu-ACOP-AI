@@ -6,10 +6,12 @@ import type {
   Session,
   Alert,
   Rule,
+  AICodeEvent,
 } from '@zhixu/shared/types';
 import { logger } from './logger';
 import { getAlerts, getRules } from './ruleService';
 import { routerService } from './routerService';
+import { getAggregatedStats, getAllEvents, hasRealEvents } from './aiCodeEventService';
 import type { RoutingStats } from '@zhixu/shared/types';
 
 export interface RouterStats {
@@ -22,104 +24,98 @@ export interface RouterStats {
   modelUsage: Record<string, number>;
 }
 
-// 内存存储（开发环境使用，生产环境应使用数据库）
-const events: Map<string, any> = new Map();
-const sessions: Map<string, Session> = new Map();
+/** 中文错误类型映射 */
+const ERROR_TYPE_NAMES: Record<string, string> = {
+  timeout: '接口超时',
+  invalid_response: '响应格式异常',
+  context_overflow: '上下文溢出',
+  rate_limit: '触发限流',
+  auth_failed: '认证失败',
+  unknown: '未知错误',
+  '': '未分类',
+};
 
-// 生成指定日期区间的 Token 趋势数据
-function generateTokenTrend(startDate: Date, endDate: Date): TokenTrend[] {
+// 基于真实事件的 Token 趋势数据
+function buildTokenTrendFromEvents(
+  byDate: Record<string, { inputTokens: number; outputTokens: number; totalTokens: number }>,
+  startDate: Date,
+  endDate: Date
+): TokenTrend[] {
   const dayMs = 24 * 60 * 60 * 1000;
   const result: TokenTrend[] = [];
   const start = new Date(startDate.toISOString().split('T')[0]);
   const end = new Date(endDate.toISOString().split('T')[0]);
-  const totalDays = Math.max(
-    1,
-    Math.round((end.getTime() - start.getTime()) / dayMs) + 1
-  );
+  const current = new Date(start.getTime());
 
-  // 伪随机种子：基于日期保证同一天相同值，同时在不同周期内变化
-  for (let i = 0; i < totalDays; i++) {
-    const date = new Date(start.getTime() + i * dayMs);
-    const dateStr = date.toISOString().split('T')[0];
-    // 使用日期字符串生成稳定伪随机
-    const seed = Array.from(dateStr).reduce(
-      (acc, c) => acc + c.charCodeAt(0),
-      0
-    );
-    const r1 = (Math.sin(seed) * 10000) % 1;
-    const r2 = (Math.cos(seed * 1.7) * 10000) % 1;
-    const inputTokens = Math.floor((Math.abs(r1) * 60000 + 10000));
-    const outputTokens = Math.floor((Math.abs(r2) * 120000 + 20000));
-
+  while (current <= end) {
+    const dateStr = current.toISOString().split('T')[0];
+    const dayData = byDate[dateStr];
     result.push({
       date: dateStr,
-      inputTokens,
-      outputTokens,
-      totalTokens: inputTokens + outputTokens,
+      inputTokens: dayData?.inputTokens || 0,
+      outputTokens: dayData?.outputTokens || 0,
+      totalTokens: dayData?.totalTokens || 0,
     });
+    current.setTime(current.getTime() + dayMs);
   }
 
   return result;
 }
 
-// 生成错误分布数据
-function generateErrorDistribution(days: number): ErrorDistribution[] {
-  const factor = Math.max(0.5, days / 7);
-  return [
-    {
-      errorType: '接口超时',
-      count: Math.round(15 * factor),
-      percentage: 35,
-    },
-    {
-      errorType: '语法错误',
-      count: Math.round(12 * factor),
-      percentage: 28,
-    },
-    {
-      errorType: 'API 调用失败',
-      count: Math.round(10 * factor),
-      percentage: 23,
-    },
-    {
-      errorType: '上下文溢出',
-      count: Math.round(4 * factor),
-      percentage: 9,
-    },
-    {
-      errorType: '其他',
-      count: Math.round(2 * factor),
-      percentage: 5,
-    },
-  ];
+// 基于真实事件的错误分布
+function buildErrorDistributionFromEvents(
+  errorDist: Record<string, number>,
+  totalRequests: number
+): ErrorDistribution[] {
+  if (totalRequests === 0) return [];
+
+  const entries = Object.entries(errorDist);
+  if (entries.length === 0) return [];
+
+  const result: ErrorDistribution[] = entries.map(([errType, count]) => {
+    const displayName = ERROR_TYPE_NAMES[errType] || errType;
+    return {
+      errorType: displayName,
+      count,
+      percentage: Number(((count / totalRequests) * 100).toFixed(1)),
+    };
+  });
+
+  // 按 count 降序排列
+  result.sort((a, b) => b.count - a.count);
+  return result;
 }
 
-// 生成工具使用统计
-function generateToolUsage(days: number): ToolUsageStats[] {
-  const factor = Math.max(0.5, days / 7);
-  return [
-    {
-      tool: 'trae',
-      requestCount: Math.round(156 * factor),
-      totalTokens: Math.round(456789 * factor),
-      avgLatency: 2100,
-      errorRate: 2.1,
-    },
-    {
-      tool: 'claude_code',
-      requestCount: Math.round(98 * factor),
-      totalTokens: Math.round(312456 * factor),
-      avgLatency: 1850,
-      errorRate: 1.8,
-    },
-    {
-      tool: 'cursor',
-      requestCount: Math.round(67 * factor),
-      totalTokens: Math.round(198234 * factor),
-      avgLatency: 2300,
-      errorRate: 2.5,
-    },
-  ];
+// 基于真实事件的工具使用统计
+function buildToolUsageFromEvents(
+  byTool: Record<string, { requestCount: number; totalTokens: number; totalLatency: number; errorCount: number }>
+): ToolUsageStats[] {
+  const tools = Object.keys(byTool);
+  if (tools.length === 0) return [];
+
+  const result: ToolUsageStats[] = tools.map((tool) => {
+    const data = byTool[tool];
+    const avgLatency = data.requestCount > 0 ? Math.round(data.totalLatency / data.requestCount) : 0;
+    const errorRate = data.requestCount > 0 ? Number(((data.errorCount / data.requestCount) * 100).toFixed(2)) : 0;
+
+    return {
+      tool,
+      requestCount: data.requestCount,
+      totalTokens: data.totalTokens,
+      avgLatency,
+      errorRate,
+    };
+  });
+
+  // 按 requestCount 降序排列
+  result.sort((a, b) => b.requestCount - a.requestCount);
+  return result;
+}
+
+// 从真实事件中提取会话统计
+function buildSessionsFromEvents(limit: number): Session[] {
+  // 由于我们通过全局聚合获取数据，这里直接从事件中反推 session 列表
+  return []; // 当前暂不支持详细会话列表，可后续扩展
 }
 
 // 解析查询参数，返回 { days, startDate, endDate }
@@ -175,70 +171,132 @@ function parseTimeRangeQuery(query: number | string | {
   return { days, startDate, endDate };
 }
 
-// 获取仪表盘统计数据
+// 获取仪表盘统计数据（从真实事件聚合）
 export async function getDashboardStats(
   query?: number | string | { days?: string; startDate?: string; endDate?: string }
 ): Promise<DashboardStats> {
-  const { days } = parseTimeRangeQuery(query ?? {});
-  const factor = Math.max(0.5, days / 7);
+  const { days, startDate, endDate } = parseTimeRangeQuery(query ?? {});
 
-  const allEvents: unknown[] = [];
-  const baseTotalTokens = 0;
-  const totalTokens = baseTotalTokens || Math.round(1234567 * factor);
-  const totalRequests = Math.round(289 * factor);
-  const avgLatency = 2100;
-  const errorRate = Number((2.1 + (factor - 1) * 0.3).toFixed(2));
-  const totalCost = Number((totalTokens * 0.00001).toFixed(2));
+  const stats = await getAggregatedStats({
+    days,
+    startDate: startDate.toISOString().split('T')[0],
+    endDate: endDate.toISOString().split('T')[0],
+  });
+
+  const avgLatency = stats.totalRequests > 0 ? Math.round(stats.totalLatency / stats.totalRequests) : 0;
+  const errorRate = stats.totalRequests > 0 ? Number(((stats.errorCount / stats.totalRequests) * 100).toFixed(2)) : 0;
+  const totalCost = Number((stats.totalTokens * 0.00001).toFixed(2));
 
   return {
-    totalTokens,
-    totalRequests,
+    totalTokens: stats.totalTokens,
+    totalRequests: stats.totalRequests,
     avgLatency,
     errorRate,
     totalCost,
-    activeSessions: 12,
+    activeSessions: stats.sessionCount,
   };
 }
 
-// 获取 Token 消耗趋势
+// 获取 Token 消耗趋势（从真实事件聚合）
 export async function getTokenTrend(
   query?: number | string | { days?: string; startDate?: string; endDate?: string }
 ): Promise<TokenTrend[]> {
-  const { startDate, endDate } = parseTimeRangeQuery(query ?? {});
-  return generateTokenTrend(startDate, endDate);
+  const { days, startDate, endDate } = parseTimeRangeQuery(query ?? {});
+
+  const stats = await getAggregatedStats({
+    days,
+    startDate: startDate.toISOString().split('T')[0],
+    endDate: endDate.toISOString().split('T')[0],
+  });
+
+  return buildTokenTrendFromEvents(stats.byDate, startDate, endDate);
 }
 
-// 获取错误分布
+// 获取错误分布（从真实事件聚合）
 export async function getErrorDistribution(
   query?: number | string | { days?: string; startDate?: string; endDate?: string }
 ): Promise<ErrorDistribution[]> {
-  const { days } = parseTimeRangeQuery(query ?? {});
-  return generateErrorDistribution(days);
+  const { days, startDate, endDate } = parseTimeRangeQuery(query ?? {});
+
+  const stats = await getAggregatedStats({
+    days,
+    startDate: startDate.toISOString().split('T')[0],
+    endDate: endDate.toISOString().split('T')[0],
+  });
+
+  return buildErrorDistributionFromEvents(stats.errorDistribution, stats.totalRequests);
 }
 
-// 获取工具使用统计
+// 获取工具使用统计（从真实事件聚合）
 export async function getToolUsageStats(
   query?: number | string | { days?: string; startDate?: string; endDate?: string }
 ): Promise<ToolUsageStats[]> {
-  const { days } = parseTimeRangeQuery(query ?? {});
-  return generateToolUsage(days);
+  const { days, startDate, endDate } = parseTimeRangeQuery(query ?? {});
+
+  const stats = await getAggregatedStats({
+    days,
+    startDate: startDate.toISOString().split('T')[0],
+    endDate: endDate.toISOString().split('T')[0],
+  });
+
+  return buildToolUsageFromEvents(stats.byTool);
 }
 
-// 获取最近会话
+// 获取最近会话（从真实事件反推）
 export async function getRecentSessions(limit: number = 10): Promise<Session[]> {
-  const allSessions = Array.from(sessions.values());
-  return allSessions
-    .sort((a, b) => (b.startTime || 0) - (a.startTime || 0))
-    .slice(0, limit);
+  const events = await getAllEvents();
+  if (events.length === 0) return [];
+
+  // 按 sessionId 聚合，找到每个 session 的最新事件时间
+  const sessionMap = new Map<
+    string,
+    { sessionId: string; startTime: number; lastEventTime: number; eventCount: number; tool: string; totalTokens: number }
+  >();
+
+  for (const event of events) {
+    const key = event.sessionId || 'unknown';
+    const existing = sessionMap.get(key);
+    if (!existing) {
+      sessionMap.set(key, {
+        sessionId: key,
+        startTime: event.timestamp,
+        lastEventTime: event.timestamp,
+        eventCount: 1,
+        tool: event.tool || 'unknown',
+        totalTokens: event.tokenConsumption?.total || 0,
+      });
+    } else {
+      existing.startTime = Math.min(existing.startTime, event.timestamp);
+      existing.lastEventTime = Math.max(existing.lastEventTime, event.timestamp);
+      existing.eventCount++;
+      existing.totalTokens += event.tokenConsumption?.total || 0;
+    }
+  }
+
+  // 按最后事件时间降序排列，取最近 limit 个
+  const sessions = Array.from(sessionMap.values())
+    .sort((a, b) => b.lastEventTime - a.lastEventTime)
+    .slice(0, limit)
+    .map((s) => ({
+      sessionId: s.sessionId,
+      startTime: s.startTime,
+      lastEventTime: s.lastEventTime,
+      eventCount: s.eventCount,
+      tool: s.tool,
+      totalTokens: s.totalTokens,
+    })) as unknown as Session[];
+
+  return sessions;
 }
 
-// 初始化示例数据（模块加载时调用一次）
+// 检查是否有真实数据（供前端展示用）
+export function hasAnyRealData(): boolean {
+  return hasRealEvents();
+}
+
+// 初始化（保留空函数以兼容已有调用）
 export function initDashboardSamples() {
-  try {
-    logger.info('[dashboardService] 初始化模拟数据完成');
-  } catch (error) {
-    logger.error('[dashboardService] 初始化失败:', error);
-  }
+  logger.info('[dashboardService] 已切换为真实事件聚合模式');
 }
 
 /** 告警趋势数据（按天统计） */
